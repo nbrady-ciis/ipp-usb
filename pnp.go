@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/signal"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -54,10 +53,7 @@ func PnPStart(exitWhenIdle bool) PnPExitReason {
 	ticker := time.NewTicker(DevInitRetryInterval / 4)
 	tickerRunning := true
 
-	signal.Notify(sigChan,
-		os.Signal(syscall.SIGINT),
-		os.Signal(syscall.SIGTERM),
-		os.Signal(syscall.SIGHUP))
+	signal.Notify(sigChan, pnpSignals()...)
 
 	// Start control socket server
 	err := CtrlsockStart()

@@ -29,6 +29,7 @@ type Configuration struct {
 	DNSSdEnable        bool           // Enable DNS-SD advertising
 	LoopbackOnly       bool           // Use only loopback interface
 	IPV6Enable         bool           // Enable IPv6 advertising
+	BridgeMode         bool           // Running in bridge mode (disables auth, redirects)
 	ConfAuthUID        []*AuthUIDRule // [auth uid], parsed
 	LogDevice          LogLevel       // Per-device LogLevel mask
 	LogMain            LogLevel       // Main log LogLevel mask

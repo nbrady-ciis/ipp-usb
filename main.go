@@ -239,6 +239,14 @@ func printStatus() {
 func main() {
 	var err error
 
+	// Bridge mode is self-contained — dispatch before normal arg parsing.
+	// Bridge uses flag.FlagSet for its own --vid/--pid/--serial args which
+	// are incompatible with the hand-rolled parseArgv() parser.
+	if len(os.Args) >= 2 && os.Args[1] == "bridge" {
+		RunBridge(os.Args[2:])
+		return
+	}
+
 	// Initialize paths
 	err = PathsInit()
 	InitLog.Check(err)

@@ -130,11 +130,13 @@ func (proxy *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Authenticate
-	if status, err := AuthHTTPRequest(proxy.log,
-		clientAddr, serverAddr, r); err != nil {
-		proxy.httpError(session, w, r, status, err)
-		return
+	// Authenticate (skip in bridge mode — only MCT connects on loopback)
+	if !Conf.BridgeMode {
+		if status, err := AuthHTTPRequest(proxy.log,
+			clientAddr, serverAddr, r); err != nil {
+			proxy.httpError(session, w, r, status, err)
+			return
+		}
 	}
 
 	// Adjust request headers
@@ -162,7 +164,10 @@ func (proxy *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// This redirection fixes compatibility with these printers for
 	// clients that follow redirects (i.e., web browser and sane-airscan;
 	// CUPS unfortunately doesn't follow redirects)
-	if serverAddr.IP.IsLoopback() &&
+	//
+	// In bridge mode, skip this redirect — MCT sends Host: 127.0.0.1:<port>
+	// and shouldn't be redirected
+	if !Conf.BridgeMode && serverAddr.IP.IsLoopback() &&
 		(r.Method == "GET" || r.Method == "HEAD") {
 
 		host := strings.ToLower(r.Host)
