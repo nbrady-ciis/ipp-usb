@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 var (
@@ -29,11 +30,14 @@ var (
 // specified http.RoundTripper. It implements http.Handler
 // interface
 type HTTPProxy struct {
-	log       *Logger       // Logger instance
-	server    *http.Server  // HTTP server
-	enable    bool          // Proxy can handle incoming requests
-	transport *UsbTransport // Transport for outgoing requests
-	closeWait chan struct{} // Closed at server close
+	log          *Logger       // Logger instance
+	server       *http.Server  // HTTP server
+	enable       bool          // Proxy can handle incoming requests
+	transport    *UsbTransport // Transport for outgoing requests
+	closeWait    chan struct{} // Closed at server close
+	onDisconnect func()       // Called once on device disconnect (bridge mode)
+	disconnected int32        // Atomic flag: 1 if disconnect detected
+	onActivity   func()       // Called on each request (for idle timeout)
 }
 
 // NewHTTPProxy creates new HTTP proxy
@@ -59,9 +63,22 @@ func NewHTTPProxy(logger *Logger,
 	return proxy
 }
 
-// Close the proxy
+// Close the proxy immediately, terminating all active connections.
 func (proxy *HTTPProxy) Close() {
 	proxy.server.Close()
+	<-proxy.closeWait
+}
+
+// Shutdown gracefully shuts down the proxy, waiting for in-flight
+// requests to complete. If the timeout expires, it forces closure.
+func (proxy *HTTPProxy) Shutdown(timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	if err := proxy.server.Shutdown(ctx); err != nil {
+		// Timeout expired — force close remaining connections
+		proxy.server.Close()
+	}
 	<-proxy.closeWait
 }
 
@@ -69,6 +86,19 @@ func (proxy *HTTPProxy) Close() {
 // incoming requests can be handled
 func (proxy *HTTPProxy) Enable() {
 	proxy.enable = true
+}
+
+// SetDisconnectHandler sets a function to be called (once) when a USB
+// device disconnection is detected during request handling. Used by
+// bridge mode to trigger shutdown with exit code 2.
+func (proxy *HTTPProxy) SetDisconnectHandler(fn func()) {
+	proxy.onDisconnect = fn
+}
+
+// SetActivityHandler sets a function to be called on each incoming
+// request. Used by bridge mode for idle timeout tracking.
+func (proxy *HTTPProxy) SetActivityHandler(fn func()) {
+	proxy.onActivity = fn
 }
 
 // Handle HTTP request
@@ -82,6 +112,11 @@ func (proxy *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	session := int(atomic.AddInt32(&httpSessionID, 1)-1) % 1000
+
+	// Notify activity tracker (for idle timeout)
+	if proxy.onActivity != nil {
+		proxy.onActivity()
+	}
 
 	// Perform sanity checking
 	if !proxy.enable {
@@ -185,6 +220,17 @@ func (proxy *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Send request and obtain response status and header
 	resp, err := proxy.transport.RoundTripWithSession(session, r)
 	if err != nil {
+		// In bridge mode, detect device disconnection and return 502
+		if Conf.BridgeMode && IsDeviceDisconnect(err) {
+			proxy.httpError(session, w, r, http.StatusBadGateway, err)
+			// Notify bridge of disconnect (once)
+			if atomic.CompareAndSwapInt32(&proxy.disconnected, 0, 1) {
+				if proxy.onDisconnect != nil {
+					proxy.onDisconnect()
+				}
+			}
+			return
+		}
 		proxy.httpError(session, w, r, http.StatusServiceUnavailable, err)
 		return
 	}

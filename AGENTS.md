@@ -2,7 +2,7 @@
 
 ## Project
 
-ipp-usb — HTTP reverse proxy for IPP-over-USB printers. Single-binary Go daemon with cgo dependencies (libusb, libavahi-common, libavahi-client). Includes a **bridge mode** for use as a subprocess by the Mopria Certification Tool (MCT).
+ipp-usb — HTTP reverse proxy for IPP-over-USB printers. Single-binary Go daemon with cgo dependencies (libusb, optionally libavahi-common/libavahi-client). Includes a **bridge mode** for use as a subprocess by the Mopria Certification Tool (MCT).
 
 ## Build & Test
 
@@ -19,6 +19,14 @@ go build -tags nethttpomithttp2 -mod=vendor
 go test -tags nethttpomithttp2 -mod=vendor
 ```
 
+### Build Tags
+
+| Tag | Purpose |
+|-----|---------|
+| `nethttpomithttp2` | Excludes HTTP/2 (always used) |
+| `noavahi` | Excludes Avahi DNS-SD and skips `pkg-config: libusb-1.0`. Required for cross-compilation from macOS. When set, `CGO_CFLAGS`/`CGO_LDFLAGS` must be provided explicitly. |
+| `integration` | Enables hardware integration tests (bridge mode, requires USB printer + root) |
+
 ### Bridge Mode Cross-Compilation
 
 ```sh
@@ -29,9 +37,11 @@ go test -tags nethttpomithttp2 -mod=vendor
 ./build-bridge.sh clean    # Remove build artifacts
 ```
 
-Requires: Go 1.19+, zig (`brew install zig`), p7zip (`brew install p7zip` for Windows target).
+Requires: Go 1.17+, zig (`brew install zig`), p7zip (`brew install p7zip` for Windows target).
 
 Output goes to `dist/<platform>/ipp-usb-bridge[.exe]` plus `dist/ipp-usb-quirks/`.
+
+The build script uses `-tags "nethttpomithttp2,noavahi"` and provides explicit `CGO_CFLAGS`/`CGO_LDFLAGS` per target. It builds libusb from source for Linux targets, uses native libusb for macOS, and downloads pre-built MinGW64 static libraries for Windows.
 
 ### Integration Tests
 
@@ -39,14 +49,14 @@ Require a physical IPP-over-USB printer and root access. Gated by the `integrati
 
 ```sh
 # All bridge integration tests:
-sudo go test -v -tags "nethttpomithttp2,integration" -mod=vendor -run TestBridge -count=1
+sudo go test -v -tags "nethttpomithttp2,noavahi,integration" -mod=vendor -run TestBridge -count=1
 
 # Lifecycle tests only (ready signaling, shutdown triggers):
-sudo go test -v -tags "nethttpomithttp2,integration" -mod=vendor \
+sudo go test -v -tags "nethttpomithttp2,noavahi,integration" -mod=vendor \
     -run "TestBridge(Ready|Shutdown|GracefulDrain)" -count=1
 
 # Discovery only (no printing):
-sudo go test -v -tags "nethttpomithttp2,integration" -mod=vendor \
+sudo go test -v -tags "nethttpomithttp2,noavahi,integration" -mod=vendor \
     -run TestBridgeDiscovery -count=1
 ```
 
@@ -55,10 +65,28 @@ Set `IPP_USB_BRIDGE_BIN` env var to point at the bridge binary for out-of-proces
 ## Architecture
 
 - **Single Go package** (`package main`) at the repo root. No sub-packages.
-- Platform-specific code uses build-constraint suffixes: `_linux.go`, `_unix.go`, `_other.go`, `_stub.go`.
+- Platform-specific code uses build-constraint suffixes: `_unix.go`, `_windows.go`, `_linux.go`, `_other.go`, `_stub.go`.
 - `vendor/` contains the sole Go dependency (`github.com/OpenPrinting/goipp`).
 - `ipp-usb-quirks/` — INI-format device workaround files keyed by USB VID/PID.
 - `systemd-udev/` — udev rules and systemd service units.
+
+### Platform Files
+
+| File | Platforms | Purpose |
+|------|-----------|---------|
+| `signals_unix.go` | Unix | `bridgeSignals()` (SIGINT, SIGTERM), `pnpSignals()` (+SIGHUP) |
+| `signals_windows.go` | Windows | Same functions, no SIGHUP |
+| `flock_unix.go` | Unix | File locking via `flock(2)` (cgo) |
+| `flock_windows.go` | Windows | File locking via `LockFileEx`/`UnlockFileEx` |
+| `logger_unix.go` | Unix | TTY detection via `isatty(3)` (cgo), ANSI color output |
+| `logger_windows.go` | Windows | TTY detection via `GetConsoleMode`, enables VT processing |
+| `daemon.go` | Unix | `CloseStdInOutErr()` via `dup2`, `Daemon()` for background fork |
+| `daemon_windows.go` | Windows | Stubs (bridge runs foreground only) |
+| `paths_windows.go` | Windows | Default paths under `%ProgramData%\ipp-usb\` |
+| `dnssd_avahi.go` | Linux/FreeBSD (no `noavahi`) | Avahi-based DNS-SD (cgo, pkg-config) |
+| `dnssd_stub.go` | All others, or any platform with `noavahi` | No-op DNS-SD |
+| `tcpuid_linux.go` | Linux | TCP connection UID lookup |
+| `tcpuid_other.go` | Non-Linux | Stub UID lookup |
 
 ### Bridge Mode Files
 
@@ -66,10 +94,8 @@ Set `IPP_USB_BRIDGE_BIN` env var to point at the bridge binary for out-of-proces
 |------|---------|
 | `bridge.go` | Entry point (`RunBridge`), CLI parsing, lifecycle orchestration |
 | `bridge_find.go` | `BridgeFindDevice()` — locate USB device by VID:PID:serial |
-| `dnssd_stub.go` | No-op DNS-SD for non-Linux/FreeBSD (build tag: `!linux && !freebsd`) |
-| `signals_unix.go` | `bridgeSignals()` and `pnpSignals()` for Unix platforms |
 | `bridge_integration_test.go` | Integration tests (build tag: `integration`) |
-| `build-bridge.sh` | Cross-compilation script for all platforms |
+| `build-bridge.sh` | Cross-compilation script for all 5 platforms |
 
 ### Bridge Mode Behavior
 
@@ -91,13 +117,14 @@ SHUTDOWN           # clean exit
 ### Key Modifications for Bridge Mode
 
 - `main.go` — Early dispatch: `os.Args[1] == "bridge"` before `PathsInit`/`parseArgv`
-- `pnp.go` — Uses `pnpSignals()` from `signals_unix.go` (removed direct `syscall.SIGHUP`)
+- `pnp.go` — Uses `pnpSignals()` from platform-specific signals file
 - `conf.go` — `BridgeMode bool` field on `Configuration` struct
 - `http.go` — Auth and Host-redirect guarded by `if !Conf.BridgeMode`
+- `usbio_libusb.go` — `#cgo !noavahi pkg-config: libusb-1.0` (conditional on tag)
 
 ## Conventions
 
-- Minimum Go version: 1.11 (avoid features unavailable before Go 1.11).
+- Minimum Go version: 1.17 (`go.mod` declares `go 1.17`; `//go:build` syntax used throughout).
 - No linter or formatter is enforced in CI; standard `gofmt` style expected.
 - No CI runs the Go build or tests — only container packaging workflows exist.
 - Man page source is `ipp-usb.8.md` (ronn markdown); regenerate with `make man` (requires `ronn`).

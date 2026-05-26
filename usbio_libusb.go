@@ -19,7 +19,7 @@ import (
 	"unsafe"
 )
 
-// #cgo pkg-config: libusb-1.0
+// #cgo !noavahi pkg-config: libusb-1.0
 // #include <libusb.h>
 //
 // int libusbHotplugCallback (libusb_context *ctx, libusb_device *device,
@@ -53,6 +53,15 @@ type UsbError struct {
 // Error describes a libusb error. It implements error interface
 func (err UsbError) Error() string {
 	return err.Func + ": " + err.Code.String()
+}
+
+// IsDeviceDisconnect reports whether the error indicates the USB device
+// has been disconnected (LIBUSB_ERROR_NO_DEVICE).
+func IsDeviceDisconnect(err error) bool {
+	if uerr, ok := err.(UsbError); ok {
+		return uerr.Code == UsbENoDev
+	}
+	return false
 }
 
 // UsbErrCode represents USB I/O error code

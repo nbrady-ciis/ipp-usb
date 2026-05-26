@@ -1,5 +1,6 @@
-//go:build linux || freebsd
+//go:build (linux || freebsd) && !noavahi
 // +build linux freebsd
+// +build !noavahi
 
 /* ipp-usb - HTTP reverse proxy, backed by IPP-over-USB connection to device
  *

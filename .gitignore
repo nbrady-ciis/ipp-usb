@@ -4,3 +4,5 @@ tags
 *.orig
 *.rock
 *.snap
+dist/
+.build-bridge/

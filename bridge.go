@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // BridgeParams holds bridge mode parameters
@@ -27,6 +28,7 @@ type BridgeParams struct {
 	Port     int
 	LogDir   string
 	LogLevel string
+	Timeout  int // Idle timeout in seconds (0 = disabled)
 }
 
 // RunBridge is the entry point for bridge mode
@@ -93,13 +95,46 @@ func RunBridge(args []string) {
 	proxy := NewHTTPProxy(transport.Log(), listener, transport)
 	proxy.Enable()
 
+	// Wait for termination: signal, stdin closure, or device disconnect
+	// (whichever comes first)
+	shutdown := make(chan struct{}, 1)
+	deviceDisconnected := make(chan struct{}, 1)
+
+	// Monitor device disconnection (detected by HTTP proxy during requests)
+	proxy.SetDisconnectHandler(func() {
+		select {
+		case deviceDisconnected <- struct{}{}:
+		default:
+		}
+		// Also trigger shutdown
+		select {
+		case shutdown <- struct{}{}:
+		default:
+		}
+	})
+
+	// Optional idle timeout: if --timeout is set, shut down after that many
+	// seconds without receiving any HTTP request. Defense-in-depth for cases
+	// where stdin is not connected (e.g., manual debugging).
+	var idleTimer *time.Timer
+	if params.Timeout > 0 {
+		idleTimer = time.NewTimer(time.Duration(params.Timeout) * time.Second)
+		proxy.SetActivityHandler(func() {
+			idleTimer.Reset(time.Duration(params.Timeout) * time.Second)
+		})
+		go func() {
+			<-idleTimer.C
+			select {
+			case shutdown <- struct{}{}:
+			default:
+			}
+		}()
+	}
+
 	// Signal readiness with the actual port.
 	// Caller parses "READY <port>" to learn where to send HTTP traffic.
 	fmt.Fprintf(os.Stdout, "READY %d\n", actualPort)
 	os.Stdout.Sync()
-
-	// Wait for termination: signal OR stdin closure (whichever comes first)
-	shutdown := make(chan struct{}, 1)
 
 	// Monitor OS signals (SIGINT, SIGTERM)
 	sig := make(chan os.Signal, 1)
@@ -125,9 +160,23 @@ func RunBridge(args []string) {
 
 	<-shutdown
 
-	// Graceful shutdown
-	proxy.Close()
+	// Stop idle timer if running
+	if idleTimer != nil {
+		idleTimer.Stop()
+	}
+
+	// Graceful shutdown: drain in-flight requests (5s timeout),
+	// then release USB interfaces and close device.
+	proxy.Shutdown(5 * time.Second)
 	transport.Close(false)
+
+	// Determine exit code: 2 for device disconnect, 0 for clean shutdown
+	select {
+	case <-deviceDisconnected:
+		fmt.Fprintf(os.Stdout, "ERROR device disconnected\n")
+		os.Exit(2)
+	default:
+	}
 
 	fmt.Fprintln(os.Stdout, "SHUTDOWN")
 }
@@ -141,6 +190,7 @@ func parseBridgeArgs(args []string) BridgeParams {
 	fs.IntVar(&params.Port, "port", 0, "HTTP server port (0 = OS-assigned)")
 	fs.StringVar(&params.LogDir, "log-dir", "", "Log directory path")
 	fs.StringVar(&params.LogLevel, "log-level", "trace-ipp", "Log level")
+	fs.IntVar(&params.Timeout, "timeout", 0, "Idle timeout in seconds (0 = disabled)")
 	fs.Parse(args)
 
 	if params.VID == "" || params.PID == "" {

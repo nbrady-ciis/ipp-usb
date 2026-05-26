@@ -29,7 +29,7 @@ LIBUSB_SRC="$BUILD_DIR/libusb-${LIBUSB_VERSION}"
 
 VERSION=$(git describe --tags --always 2>/dev/null || echo "dev")
 LDFLAGS="-s -w -X main.Version=$VERSION"
-TAGS="nethttpomithttp2"
+TAGS="nethttpomithttp2,noavahi"
 
 # --- Helpers ---
 
@@ -69,6 +69,28 @@ build_libusb_static() {
     rm -rf "$TARGET_DIR"
     mkdir -p "$TARGET_DIR"
 
+    # For cross-compilation targets, use llvm-ar (via zig) to create
+    # archives in GNU format that lld can link. macOS native ar creates
+    # BSD-format archives which may not be compatible with cross-linkers.
+    local AR_CMD="ar"
+    local RANLIB_CMD="ranlib"
+    case "$HOST" in
+        *linux*|*windows*)
+            # Create zig ar/ranlib wrapper scripts
+            AR_CMD="$BUILD_DIR/zig-ar"
+            RANLIB_CMD="$BUILD_DIR/zig-ranlib"
+            cat > "$AR_CMD" <<'EOF'
+#!/bin/sh
+exec zig ar "$@"
+EOF
+            cat > "$RANLIB_CMD" <<'EOF'
+#!/bin/sh
+exec zig ranlib "$@"
+EOF
+            chmod +x "$AR_CMD" "$RANLIB_CMD"
+            ;;
+    esac
+
     (
         cd "$TARGET_DIR"
         "$LIBUSB_SRC/configure" \
@@ -80,6 +102,8 @@ build_libusb_static() {
             --disable-udev \
             --with-pic \
             CC="$CC_CMD" \
+            AR="$AR_CMD" \
+            RANLIB="$RANLIB_CMD" \
             CFLAGS="-fPIC" \
             >/dev/null 2>&1
         make -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)" \
@@ -108,39 +132,46 @@ EOF
 #   $5: CGO_CFLAGS
 #   $6: CGO_LDFLAGS
 build_bridge() {
-    local GOOS="$1" GOARCH="$2" PLATFORM="$3" CC="$4"
-    local CGO_CFLAGS="$5" CGO_LDFLAGS="$6"
+    local GOOS_VAL="$1" GOARCH_VAL="$2" PLATFORM="$3" CC_VAL="$4"
+    local CFLAGS_VAL="$5" LDFLAGS_VAL="$6"
     local OUTPUT="$DIST_DIR/$PLATFORM/ipp-usb-bridge"
-    [ "$GOOS" = "windows" ] && OUTPUT="${OUTPUT}.exe"
+    [ "$GOOS_VAL" = "windows" ] && OUTPUT="${OUTPUT}.exe"
 
     echo ""
     echo "=== Building $PLATFORM ==="
-    echo "  GOOS=$GOOS GOARCH=$GOARCH"
-    echo "  CC=$CC"
+    echo "  GOOS=$GOOS_VAL GOARCH=$GOARCH_VAL"
+    echo "  CC=$CC_VAL"
 
     mkdir -p "$DIST_DIR/$PLATFORM"
 
-    local CC_ENV=""
-    [ "$CC" != "native" ] && CC_ENV="$CC"
-
     # For Linux (musl): add -extldflags "-static" for fully static binary
     local BUILD_LDFLAGS="$LDFLAGS"
-    if [ "$GOOS" = "linux" ]; then
+    if [ "$GOOS_VAL" = "linux" ]; then
         BUILD_LDFLAGS="$LDFLAGS -extldflags \"-static\""
     fi
 
-    CGO_ENABLED=1 \
-    GOOS="$GOOS" \
-    GOARCH="$GOARCH" \
-    ${CC_ENV:+CC="$CC_ENV"} \
-    CGO_CFLAGS="$CGO_CFLAGS" \
-    CGO_LDFLAGS="$CGO_LDFLAGS" \
-        go build \
-            -ldflags "$BUILD_LDFLAGS" \
-            -tags "$TAGS" \
-            -mod=vendor \
-            -o "$OUTPUT" \
-            .
+    # Export environment for go build. Using explicit export/unset avoids
+    # shell parsing issues with inline VAR=value and conditional expansions.
+    export CGO_ENABLED=1
+    export GOOS="$GOOS_VAL"
+    export GOARCH="$GOARCH_VAL"
+    export CGO_CFLAGS="$CFLAGS_VAL"
+    export CGO_LDFLAGS="$LDFLAGS_VAL"
+    if [ "$CC_VAL" != "native" ]; then
+        export CC="$CC_VAL"
+    else
+        unset CC
+    fi
+
+    go build \
+        -ldflags "$BUILD_LDFLAGS" \
+        -tags "$TAGS" \
+        -mod=vendor \
+        -o "$OUTPUT" \
+        .
+
+    # Clean up exported variables
+    unset CGO_ENABLED GOOS GOARCH CGO_CFLAGS CGO_LDFLAGS CC
 
     echo "  -> $OUTPUT ($(du -h "$OUTPUT" | awk '{print $1}'))"
     file "$OUTPUT"
@@ -209,14 +240,14 @@ build_windows_amd64() {
         7z x -o"$WIN_DIR" "$WIN_7Z" >/dev/null
     fi
 
-    # Find MinGW64 static lib and headers
+    # Find MinGW64 static lib and headers.
+    # libusb archive layout: include/libusb.h, MinGW64/static/libusb-1.0.a
     local INCLUDE_DIR
-    INCLUDE_DIR=$(find "$WIN_DIR" -path "*/include/libusb-1.0" -type d | head -1)
-    INCLUDE_DIR=$(dirname "$INCLUDE_DIR")  # parent of libusb-1.0/
+    INCLUDE_DIR=$(find "$WIN_DIR" -name "libusb.h" -not -path "*/examples/*" -exec dirname {} \; | head -1)
     local LIB_DIR
     LIB_DIR=$(find "$WIN_DIR" -path "*/MinGW64/static" -type d | head -1)
 
-    [ -d "$INCLUDE_DIR" ] || die "Windows libusb headers not found in archive"
+    [ -n "$INCLUDE_DIR" ] || die "Windows libusb headers not found in archive"
     [ -d "$LIB_DIR" ] || die "Windows libusb static lib not found in archive"
 
     make_zig_cc "x86_64-windows-gnu"
